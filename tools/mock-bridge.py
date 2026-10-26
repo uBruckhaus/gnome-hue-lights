@@ -16,7 +16,7 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BRIDGE_ID = "C42996FFFEC9B46D"   # the certificate's CN must match it
+BRIDGE_ID = "001788FFFE5A3C21"   # the certificate's CN must match it
 APP_KEY = "mock-app-key-1234567890"
 
 

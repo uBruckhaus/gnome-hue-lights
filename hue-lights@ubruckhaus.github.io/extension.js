@@ -268,10 +268,12 @@ function button(text, onClick, styleClass = 'hue-button') {
     return actor;
 }
 
-// A GNOME switch the user can click (PopupMenu.Switch itself is not reactive).
+// A GNOME switch inside a button. The switch's own handle can be dragged, which would change
+// what it shows without a command; it is not reactive, so the button gets every click.
 class ToggleButton {
     constructor(onToggle, small = false) {
         this._switch = new PopupMenu.Switch(false);
+        this._switch.reactive = false;
         if (small)
             this._switch.add_style_class_name('hue-switch-small');
         this.actor = new St.Button({child: this._switch, can_focus: true, y_align: Clutter.ActorAlign.CENTER,
@@ -284,12 +286,17 @@ class ToggleButton {
     }
 }
 
-// The shell slider changes its value on the mouse wheel; inside the scrolling room list
-// that would dim (or switch on) lights while scrolling, so the wheel scrolls the list.
+// The shell slider changes its value on the mouse wheel (through ScrollController actions);
+// inside the scrolling room list that would dim (or switch on) lights while scrolling, so
+// those actions go and the wheel scrolls the list.
 const ListSlider = GObject.registerClass(
 class HueListSlider extends Slider.Slider {
-    vfunc_scroll_event() {
-        return Clutter.EVENT_PROPAGATE;
+    _init(value) {
+        super._init(value);
+        for (const action of this.get_actions()) {
+            if (action instanceof Clutter.ScrollController)
+                this.remove_action(action);
+        }
     }
 });
 
@@ -612,7 +619,7 @@ class HuePanel {
 
         menu.connect('open-state-changed', (_menu, open) => {
             this.send({cmd: open ? 'open' : 'closed'});
-            if (open) {
+            if (open) {     // this._stats is the newest snapshot: setStats keeps it while closed
                 const workArea = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
                 const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
                 this._scroll.style = `max-height: ${Math.max(220, Math.min(560, Math.round(workArea.height / scale) - 300))}px;`;
@@ -632,7 +639,7 @@ class HuePanel {
         this._candidates = vbox({style_class: 'hue-candidates'});
         this._notFound = wrapping(dimmed(label('', 'hue-caption', {x_expand: true})));
         const manual = hbox({style_class: 'hue-manual'});
-        this._ipEntry = new St.Entry({style_class: 'hue-entry', hint_text: 'Bridge IP, e.g. 192.168.178.106',
+        this._ipEntry = new St.Entry({style_class: 'hue-entry', hint_text: 'Bridge IP, e.g. 192.168.1.50',
             can_focus: true, x_expand: true});
         this._ipEntry.clutter_text.max_length = 64;
         this._ipEntry.clutter_text.connect('activate', () => this._pairManual());
@@ -685,6 +692,13 @@ class HuePanel {
 
     send(command) {
         this._indicator.send(command);
+    }
+
+    // Every snapshot is kept; the widgets follow only while the menu is open.
+    setStats(stats, open) {
+        this._stats = stats;
+        if (open)
+            this.update(stats);
     }
 
     isExpanded(room) {
@@ -836,8 +850,7 @@ class HueLightsIndicator extends PanelMenu.Button {
     setStats(stats) {
         this._stats = stats;
         this._render();
-        if (this.menu.isOpen)
-            this._panel.update(stats);
+        this._panel.setStats(stats, this.menu.isOpen);
     }
 
     // What the Omarchy widget's tooltip said: for screen readers here.

@@ -3,6 +3,15 @@
 pair_with_mock
 cat >> "$EXT/extension.js" <<'JS'
 import Shell from 'gi://Shell';
+// Screenshots may be published: show a neutral address instead of this PC's LAN address
+// (the mock bridge listens there).
+const _origUpdate = HuePanel.prototype.update;
+HuePanel.prototype.update = function (stats) {
+    _origUpdate.call(this, stats);
+    const real = GLib.getenv('MOCK_IP');
+    for (const actor of [this._heroMeta, this._bridgeText])
+        actor.text = actor.text.replace(real, '192.168.1.20');
+};
 const _origEnable = HueLightsExtension.prototype.enable;
 HueLightsExtension.prototype.enable = function () {
     _origEnable.call(this);
@@ -40,6 +49,9 @@ HueLightsExtension.prototype.enable = function () {
                         card('Bedroom')._bri.slider.value = 0.6;                     // bedroom 60 %
                         const plug = [...card('Other lights')._lightRows.values()][0];
                         console.log(`[Hue Lights] plug row slider visible ${plug._bri.slider.visible}`);
+                        const living = card('Living room');
+                        const scrollers = living._bri.slider.get_actions().filter(a => a instanceof Clutter.ScrollController).length;
+                        console.log(`[Hue Lights] slider scroll controllers ${scrollers}, switch reactive ${living._switch._switch.reactive}`);
                         later(3500, () => shot('panel-after-controls', () => {
                             ind.menu.close(false);
                             ind._allOff();                                           // what the right click does

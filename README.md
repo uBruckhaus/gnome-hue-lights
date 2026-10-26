@@ -49,6 +49,7 @@ A helper (`scripts/hue-lights.py`) runs while the extension is enabled. The exte
 - No language setting and no plugin Information page; Unpair sits at the bottom of the panel instead of a settings page.
 - The app key lives in `~/.config/hue-lights/` instead of `~/.config/omarchy/hue-lights/`, and the bridge lists the app as `gnome_hue_lights`.
 - An active scene is always shown, also when it is not among the first six.
+- The helper also has fixes from a review of this port: CLIP error replies count as failures, a bridge reply of an unexpected shape shows an error instead of stopping all updates, Cancel or Unpair during a pairing request cannot still save a key, `avahi-browse` ends with the helper, and a FIFO at the config path cannot block it.
 
 ## Update or remove
 

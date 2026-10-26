@@ -11,12 +11,21 @@ if [ -z "${HL_INNER:-}" ]; then
     # The private bus (and the dconf service it starts) must see the temporary folders.
     T=$(mktemp -d)
     mkdir -p "$T/config" "$T/data" "$T/cache" "$T/state"
-    export HL_INNER=1 T XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_CACHE_HOME=$T/cache XDG_STATE_HOME=$T/state
+    echo "$$" > "$T/.headless-test"
+    export HL_INNER=1 HL_OUTER_BUS="${DBUS_SESSION_BUS_ADDRESS:-}" T \
+        XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_CACHE_HOME=$T/cache XDG_STATE_HOME=$T/state
     dbus-run-session -- "$0" "$@" 2> >(grep -v -e dbus-daemon -e fusermount >&2)
     status=$?
     rm -rf "$T"
     exit $status
 fi
+# Inner run: only inside the folders and on the private bus the outer run made, never the
+# real session's (an HL_INNER=1 inherited from elsewhere must not install or set anything).
+case "${T:-}" in /tmp/tmp.*) ;; *) echo "not started by the outer run" >&2; exit 1 ;; esac
+[ -f "$T/.headless-test" ] && [ "$XDG_CONFIG_HOME" = "$T/config" ] && [ "$XDG_DATA_HOME" = "$T/data" ] \
+    && [ "$XDG_CACHE_HOME" = "$T/cache" ] && [ "$XDG_STATE_HOME" = "$T/state" ] \
+    && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ "$DBUS_SESSION_BUS_ADDRESS" != "${HL_OUTER_BUS:-}" ] \
+    || { echo "refusing to run outside the test's own folders and bus" >&2; exit 1; }
 EXT=$XDG_DATA_HOME/gnome-shell/extensions/$UUID
 "$ROOT/tools/build.sh" >/dev/null && mkdir -p "$EXT" && unzip -q "$ROOT/dist/$UUID.shell-extension.zip" -d "$EXT" \
     || { echo "build failed" >&2; exit 1; }
@@ -29,7 +38,7 @@ gsettings set org.gnome.shell welcome-dialog-last-shown-version "$(gnome-shell -
 MOCK_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
 [ -n "$MOCK_IP" ] || { echo "no LAN address for the mock bridge" >&2; exit 1; }
 MOCK_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')
-openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=C42996FFFEC9B46D \
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=001788FFFE5A3C21 \
     -keyout "$T/mock-key.pem" -out "$T/mock-cert.pem" 2>/dev/null
 MOCK_FP=$(openssl x509 -in "$T/mock-cert.pem" -outform der | sha256sum | cut -d' ' -f1)
 MOCK_LOG=$T/mock-commands.log
@@ -41,7 +50,7 @@ export HUE_LIGHTS_BRIDGE_PORT=$MOCK_PORT MOCK_IP
 # Writes the helper's config as if paired with the mock bridge.
 pair_with_mock() {
     mkdir -p -m 700 "$XDG_CONFIG_HOME/hue-lights"
-    printf '{"ip":"%s","bridge_id":"C42996FFFEC9B46D","fingerprint":"%s","app_key":"mock-app-key-1234567890","name":"Mock Hue Bridge","model":"BSB002"}' \
+    printf '{"ip":"%s","bridge_id":"001788FFFE5A3C21","fingerprint":"%s","app_key":"mock-app-key-1234567890","name":"Mock Hue Bridge","model":"BSB002"}' \
         "$MOCK_IP" "$MOCK_FP" > "$XDG_CONFIG_HOME/hue-lights/config.json"
     chmod 600 "$XDG_CONFIG_HOME/hue-lights/config.json"
 }
