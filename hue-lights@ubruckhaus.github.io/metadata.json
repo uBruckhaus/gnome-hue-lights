@@ -1,0 +1,8 @@
+{
+  "uuid": "hue-lights@ubruckhaus.github.io",
+  "name": "Hue Lights",
+  "description": "Control your Philips Hue lights from the top bar: rooms, zones and single lights on and off, brightness and scenes, straight over your local Hue bridge (no cloud, pinned HTTPS). Left click opens the panel, right click switches every light off. Needs python3 and avahi-browse.",
+  "shell-version": ["51"],
+  "url": "https://github.com/uBruckhaus/gnome-hue-lights",
+  "version-name": "0.1.0"
+}

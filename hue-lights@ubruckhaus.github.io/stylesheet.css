@@ -1,0 +1,211 @@
+/* Header */
+.hue-hero {
+  width: 420px;
+  spacing: 12px;
+  padding: 2px 6px;
+}
+
+.hue-hero-icon {
+  icon-size: 32px;
+}
+
+.hue-accent {
+  color: -st-accent-color;
+}
+
+.hue-title {
+  font-weight: bold;
+  font-size: 1.15em;
+}
+
+.hue-pill {
+  font-size: 0.85em;
+  font-weight: bold;
+  padding: 2px 8px;
+  border-radius: 99px;
+  border: 1px solid rgba(128, 128, 128, 0.5);
+}
+
+.hue-caption {
+  font-size: 0.9em;
+  font-feature-settings: "tnum";
+}
+
+.hue-body {
+  font-size: 1em;
+}
+
+.hue-error {
+  color: #e01b24;
+  width: 420px;
+}
+
+/* Buttons (pills in the panel) */
+.hue-button {
+  padding: 4px 12px;
+  border-radius: 99px;
+  font-size: 0.9em;
+}
+
+.hue-danger {
+  color: #e01b24;
+}
+
+/* Pairing */
+.hue-pairing {
+  width: 420px;
+  spacing: 8px;
+  padding: 0 6px;
+}
+
+.hue-candidates,
+.hue-candidate,
+.hue-manual,
+.hue-pair-actions {
+  spacing: 8px;
+}
+
+.hue-entry {
+  min-width: 0;
+}
+
+/* Rooms */
+.hue-rooms-item {
+  padding: 0 8px;
+}
+
+.hue-scroll {
+  width: 436px;
+}
+
+.hue-rooms {
+  spacing: 8px;
+  /* room on the right for the overlay scrollbar */
+  padding: 2px 10px 2px 2px;
+}
+
+.hue-room {
+  spacing: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(128, 128, 128, 0.15);
+  background-color: rgba(128, 128, 128, 0.06);
+}
+
+.hue-room-head {
+  spacing: 6px;
+}
+
+.hue-expander {
+  border-radius: 8px;
+  padding: 0;
+}
+
+.hue-expander:hover .hue-chevron,
+.hue-expander:focus .hue-chevron {
+  opacity: 1;
+}
+
+.hue-expander > StBoxLayout {
+  spacing: 10px;
+}
+
+.hue-badge {
+  width: 34px;
+  height: 34px;
+  border-radius: 99px;
+  background-color: rgba(128, 128, 128, 0.15);
+}
+
+.hue-badge-icon {
+  icon-size: 18px;
+}
+
+.hue-room-name {
+  font-weight: bold;
+}
+
+.hue-chevron {
+  icon-size: 14px;
+  opacity: 0.7;
+}
+
+.hue-switch-button {
+  padding: 2px;
+  border-radius: 99px;
+}
+
+.hue-switch-button:focus {
+  box-shadow: inset 0 0 0 2px -st-accent-color;
+}
+
+.hue-bri-row {
+  spacing: 10px;
+}
+
+.hue-pct {
+  min-width: 40px;
+  text-align: right;
+}
+
+.hue-details {
+  spacing: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(128, 128, 128, 0.2);
+}
+
+.hue-lights {
+  spacing: 6px;
+}
+
+.hue-light {
+  spacing: 10px;
+  padding-left: 10px;
+}
+
+.hue-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 99px;
+  border: 1px solid rgba(128, 128, 128, 0.8);
+  margin-right: 4px;
+}
+
+.hue-slider-small {
+  width: 110px;
+}
+
+.hue-scenes {
+  spacing: 6px;
+}
+
+.hue-scene-row {
+  spacing: 6px;
+}
+
+.hue-scene {
+  padding: 2px 10px;
+  border-radius: 99px;
+  font-size: 0.85em;
+}
+
+.hue-scene-active {
+  background-color: -st-accent-color;
+  color: -st-accent-fg-color;
+}
+
+.hue-scene-more {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* Bridge */
+.hue-bridge-row {
+  width: 420px;
+  spacing: 10px;
+  padding: 0 6px;
+}
+
+.hue-bridge-label {
+  min-width: 52px;
+}

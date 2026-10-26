@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Philips Hue bridge helper for the Hue Lights Omarchy plugin.
+"""Philips Hue bridge helper for the Hue Lights GNOME Shell extension.
 
 Long-running process: reads one JSON command per line on stdin and prints one
 JSON snapshot per line on stdout. Talks to the bridge's local CLIP v2 API over
 HTTPS only. The bridge certificate is self-signed by Philips, so it is pinned
 (SHA-256 fingerprint + CN == bridge id) when pairing and checked on every
 connection afterwards. The application key lives in
-~/.config/omarchy/hue-lights/config.json (mode 0600) and never leaves this
-process.
+$XDG_CONFIG_HOME/hue-lights/config.json (~/.config/hue-lights, mode 0600) and
+never leaves this process.
 """
 
 import hashlib
@@ -26,7 +26,13 @@ import sys
 import threading
 import time
 
-CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "omarchy", "hue-lights")
+def _config_home():
+    """$XDG_CONFIG_HOME when it is an absolute path (the spec ignores relative ones), else ~/.config."""
+    home = os.environ.get("XDG_CONFIG_HOME", "")
+    return home if os.path.isabs(home) else os.path.join(os.path.expanduser("~"), ".config")
+
+
+CONFIG_DIR = os.path.join(_config_home(), "hue-lights")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 POLL_OPEN = 2.0       # seconds between refreshes while the panel is open
@@ -35,6 +41,14 @@ PAIR_WINDOW = 35.0    # how long to keep asking for a key after "pair"
 LIGHT_INTERVAL = 0.12 # Hue guidance: ~10 light commands per second
 GROUP_INTERVAL = 0.6  # ... and ~1 group command per second
 HTTP_TIMEOUT = 4.0     # overall deadline per request: connect, TLS, headers and body
+# The bridge always listens on 443. HUE_LIGHTS_BRIDGE_PORT exists for the test harness's
+# mock bridge (tools/mock-bridge.py), which cannot bind 443 without root.
+try:
+    BRIDGE_PORT = int(os.environ.get("HUE_LIGHTS_BRIDGE_PORT", "443"))
+except ValueError:
+    BRIDGE_PORT = 443
+if not 1 <= BRIDGE_PORT <= 65535:
+    BRIDGE_PORT = 443
 MAX_BODY = 4 * 1024 * 1024
 MAX_CONFIG = 64 * 1024
 # Rooms and zones name their lights directly or through devices, and nothing stops
@@ -350,7 +364,7 @@ def parse_command(line):
 # Config
 
 def private_config_dir():
-    """Create ~/.config/omarchy/hue-lights as 0700 and refuse it unless it is our own real directory."""
+    """Create the config directory as 0700 and refuse it unless it is our own real directory."""
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     info = os.lstat(CONFIG_DIR)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
@@ -458,12 +472,13 @@ class PinError(Exception):
     pass
 
 
-def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=HTTP_TIMEOUT, port=443):
+def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=HTTP_TIMEOUT, port=None):
     """One HTTPS request to the bridge. Returns (status, parsed_json, (fingerprint, cn)).
 
     With `pin`, the peer certificate must match pin["fingerprint"] and have
     CN == pin["bridge_id"], otherwise PinError is raised before anything is sent.
     """
+    port = port or BRIDGE_PORT
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # self-signed Philips cert; pinned below instead
@@ -654,7 +669,7 @@ class Hue:
                 return
             host = clean(socket.gethostname(), 19) or "pc"
             _, resp, peer2 = https_request(ip, "POST", "/api",
-                                           {"devicetype": "omarchy_hue_lights#" + host, "generateclientkey": True})
+                                           {"devicetype": "gnome_hue_lights#" + host, "generateclientkey": True})
             if peer2 != peer:
                 raise PinError("certificate changed during pairing")
             entry = resp[0] if isinstance(resp, list) and resp and isinstance(resp[0], dict) else {}

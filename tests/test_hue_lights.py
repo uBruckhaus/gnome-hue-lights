@@ -3,7 +3,7 @@ import os
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location("hue", os.path.join(HERE, "..", "scripts", "hue-lights.py"))
+spec = importlib.util.spec_from_file_location("hue", os.path.join(HERE, "..", "hue-lights@ubruckhaus.github.io", "scripts", "hue-lights.py"))
 hue = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hue)
 
