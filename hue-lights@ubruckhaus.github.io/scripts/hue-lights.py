@@ -10,13 +10,16 @@ $XDG_CONFIG_HOME/hue-lights/config.json (~/.config/hue-lights, mode 0600) and
 never leaves this process.
 """
 
+import atexit
 import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import ssl
@@ -52,6 +55,8 @@ if not 1 <= BRIDGE_PORT <= 65535:
     BRIDGE_PORT = 443
 MAX_BODY = 4 * 1024 * 1024
 MAX_CONFIG = 64 * 1024
+MAX_PENDING = 256     # queued light/group/scene commands at most (one per resource)
+MAX_COMMAND = 4096    # bytes per panel command line; longer lines are dropped unread
 # Rooms and zones name their lights directly or through devices, and nothing stops
 # a bridge from repeating them: each group keeps a light once and at most
 # MAX_GROUP_LIGHTS of them, all groups together at most MAX_MEMBERSHIPS. The lights
@@ -86,6 +91,16 @@ def valid_bridge_ip(value):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def finite(value, default, low, high):
+    """A bridge or panel number as a float in [low, high]; `default` for NaN, infinities and junk
+    (json.loads accepts NaN/Infinity, which the panel's JSON.parse would reject)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return clamp(number, low, high) if math.isfinite(number) else default
 
 
 def clean(text, limit=60):
@@ -138,11 +153,8 @@ def _gamma(c):
 
 def xy_to_hex(x, y):
     """CIE xy (Hue colour) to an sRGB hex string at full brightness, for a swatch."""
-    try:
-        x, y = float(x), float(y)
-    except (TypeError, ValueError):
-        return "#ffd27a"
-    if y <= 0:
+    x, y = finite(x, None, 0.0, 1.0), finite(y, None, 0.0, 1.0)
+    if x is None or y is None or y <= 0:
         return "#ffd27a"
     z = 1.0 - x - y
     Y = 1.0
@@ -159,10 +171,10 @@ def xy_to_hex(x, y):
 
 def mirek_to_hex(mirek):
     """Colour temperature (mirek) to an approximate sRGB hex (Tanner Helland fit)."""
-    try:
-        kelvin = 1000000.0 / float(mirek)
-    except (TypeError, ValueError, ZeroDivisionError):
+    mirek = finite(mirek, None, 1.0, 1000000.0)
+    if mirek is None:
         return "#ffd27a"
+    kelvin = 1000000.0 / mirek
     t = clamp(kelvin, 1000, 40000) / 100.0
     import math
     if t <= 66:
@@ -186,6 +198,15 @@ def light_color(light):
     if ct.get("mirek"):
         return mirek_to_hex(ct["mirek"])
     return "#ffd27a"
+
+
+def brightness(value):
+    """A bridge brightness in 0..100; anything else (a string, NaN, an infinity) makes the whole
+    reply one this app does not understand, rather than a value the panel cannot parse."""
+    number = finite(value, None, 0.0, 100.0)
+    if number is None:
+        raise ValueError("unexpected brightness")
+    return number
 
 
 def blend_colors(colors):
@@ -218,7 +239,7 @@ def build_model(resources):
             "id": light["id"],
             "name": clean((light.get("metadata") or {}).get("name") or "Light"),
             "on": bool((light.get("on") or {}).get("on")),
-            "bri": round(float(dimming.get("brightness", 100.0)), 1),
+            "bri": round(brightness(dimming.get("brightness", 100.0)), 1),
             "dimmable": "dimming" in light,
             "color": light_color(light),
             "reachable": connectivity.get(owner, True),
@@ -298,6 +319,7 @@ def build_model(resources):
             on_members = [l for l in members if l["on"]]
             gl = grouped.get(gl_id) or {}
             bri = (gl.get("dimming") or {}).get("brightness")
+            bri = None if bri is None else brightness(bri)
             if bri is None:
                 bri = sum(l["bri"] for l in on_members) / len(on_members) if on_members else 0
             rooms.append({
@@ -357,9 +379,27 @@ def parse_avahi_hue(lines):
 def parse_command(line):
     try:
         cmd = json.loads(line)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return None
     return cmd if isinstance(cmd, dict) and isinstance(cmd.get("cmd"), str) else None
+
+
+def read_commands(stream):
+    """Commands from a binary stream, one JSON object per line. A line longer than MAX_COMMAND
+    is skipped through its newline without being kept in memory."""
+    while True:
+        line = stream.readline(MAX_COMMAND + 1)
+        if not line:
+            return
+        if len(line) > MAX_COMMAND:
+            while not line.endswith(b"\n"):
+                line = stream.readline(MAX_COMMAND + 1)
+                if not line:
+                    return
+            continue
+        cmd = parse_command(line)
+        if cmd:
+            yield cmd
 
 
 # ---------------------------------------------------------------------------
@@ -432,21 +472,39 @@ def remove_config():
         os.unlink(CONFIG_PATH)
 
 
-def _die_with_parent():
-    """In a child process: end it when the helper ends (PR_SET_PDEATHSIG), so a helper that is
-    killed while it waits does not leave avahi-browse running."""
-    try:
-        import ctypes
-        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)
-    except (OSError, AttributeError):
-        pass
+# Children the helper started and has not reaped yet: ended when the helper exits or gets SIGTERM.
+_CHILDREN = set()
+_CHILDREN_LOCK = threading.Lock()
+_SETPRIV = None   # path of util-linux setpriv, "" when it is not installed; looked up once
+
+
+def kill_children():
+    with _CHILDREN_LOCK:
+        children = list(_CHILDREN)
+    for proc in children:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+
+
+def _parent_death_prefix():
+    """`setpriv --pdeathsig KILL --` so a child ends even when the helper is SIGKILLed. No Python
+    preexec_fn: running Python between fork and exec in this threaded process can deadlock."""
+    global _SETPRIV
+    if _SETPRIV is None:
+        _SETPRIV = shutil.which("setpriv") or ""
+    return [_SETPRIV, "--pdeathsig", "KILL", "--"] if _SETPRIV else []
 
 
 def run_bounded(argv, timeout=6.0, max_bytes=262144):
     """Run a fixed argv (no shell) and read at most `max_bytes` of stdout before `timeout`."""
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                preexec_fn=_die_with_parent)
+        with _CHILDREN_LOCK:
+            proc = subprocess.Popen(_parent_death_prefix() + list(argv), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            _CHILDREN.add(proc)
     except OSError:
         return ""
     chunks, size = [], 0
@@ -475,6 +533,8 @@ def run_bounded(argv, timeout=6.0, max_bytes=262144):
             proc.wait(timeout=0.5)
         except subprocess.SubprocessError:
             pass
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
     return b"".join(chunks).decode("utf-8", "replace")
 
 
@@ -483,6 +543,10 @@ def run_bounded(argv, timeout=6.0, max_bytes=262144):
 
 class PinError(Exception):
     pass
+
+
+class BridgeError(Exception):
+    """The bridge answered with CLIP "errors": a fixed message, never the bridge's own text."""
 
 
 def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=HTTP_TIMEOUT, port=None):
@@ -497,12 +561,15 @@ def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=H
     ctx.verify_mode = ssl.CERT_NONE  # self-signed Philips cert; pinned below instead
     conn = http.client.HTTPSConnection(ip, port, timeout=timeout, context=ctx)
     # One overall deadline: a responder that drips headers or body byte by byte is
-    # cut off when the timer shuts the socket down, not just per recv().
+    # cut off when the timer shuts the socket down, not just per recv(). The socket is
+    # kept here because a "Connection: close" reply takes it away from conn.sock.
     expired = threading.Event()
+    connected = []
+    resp = None
 
     def cut():
         expired.set()
-        sock = conn.sock
+        sock = connected[0] if connected else conn.sock
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -513,6 +580,9 @@ def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=H
     watchdog.start()
     try:
         conn.connect()
+        connected.append(conn.sock)
+        if expired.is_set():
+            raise OSError("bridge reply timed out")
         der = conn.sock.getpeercert(binary_form=True) or b""
         peer = (fingerprint(der), cert_common_name(der).upper())
         if pin is not None:
@@ -530,6 +600,8 @@ def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=H
             raise OSError("reply too large")
         chunks, size = [], 0
         while size <= MAX_BODY:
+            if expired.is_set():
+                raise OSError("bridge reply timed out")
             chunk = resp.read1(65536)
             if not chunk:
                 break
@@ -542,12 +614,16 @@ def https_request(ip, method, path, body=None, headers=None, pin=None, timeout=H
         raw = b"".join(chunks)
         try:
             parsed = json.loads(raw.decode("utf-8")) if raw else None
-        except ValueError:
+        except (ValueError, RecursionError):
             parsed = None
         return resp.status, parsed, peer
     finally:
         watchdog.cancel()
+        if resp is not None:
+            resp.close()
         conn.close()
+        for sock in connected:
+            sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -572,16 +648,34 @@ class Hue:
         self.pair_ip = ""
         self.pair_until = 0.0
         self.pair_generation = 0   # bumped by pair, cancel_pair and unpair
+        # Bumped by pair, a saved pairing and unpair: a refresh, relocation or command that
+        # started under an older connection drops its result.
+        self.conn_generation = 0
+        # Keys this process has held (application key, client key): never part of an error text.
+        self.secrets = {self.config["app_key"]} if self.config.get("app_key") else set()
         self.pending = {}          # (kind, id) -> body, coalesced
         self.last_sent = {"light": 0.0, "grouped_light": 0.0, "scene": 0.0}
         self.last_refresh = 0.0
         self.refresh_hold_until = 0.0
 
+    def redact(self, text):
+        text = str(text)
+        for secret in self.secrets | {self.config.get("app_key") or ""}:
+            if len(secret) >= 6:
+                text = text.replace(secret, "***")
+        return text
+
+    def safe(self, exc, limit):
+        """An exception's text for the panel: keys removed first, then cleaned and cut."""
+        return clean(self.redact(exc), limit)
+
     def set_error(self, code, text, *args):
-        """English message for logs and old panels, plus a code and arguments the panel translates."""
-        self.error = text % args if args else text
+        """English message for logs and old panels, plus a code and arguments the panel translates.
+        Keys are removed from every part as a backstop."""
+        args = [self.redact(a) for a in args]
+        self.error = self.redact(text % tuple(args) if args else text)
         self.error_code = code
-        self.error_args = [str(a) for a in args]
+        self.error_args = args
 
     # -- output
     def snapshot(self):
@@ -600,83 +694,139 @@ class Hue:
             }
 
     def emit(self):
-        line = json.dumps(self.snapshot(), separators=(",", ":"))
+        # Taken, serialised and written under one lock, so snapshots leave in the order they were
+        # taken (an older one can never overwrite the panel's view after Unpair).
         with self.lock:
+            snap = self.snapshot()
+            try:
+                line = json.dumps(snap, separators=(",", ":"), allow_nan=False)
+            except ValueError:   # backstop: a non-finite number the parsers missed
+                self.rooms, self.light_count, self.on_count, self.phase = [], 0, 0, "error"
+                self.set_error("errReply", "The bridge sent a reply this app does not understand.")
+                line = json.dumps(self.snapshot(), separators=(",", ":"), allow_nan=False)
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
 
     # -- bridge access
-    def pin(self):
-        return {"fingerprint": self.config.get("fingerprint"), "bridge_id": self.config.get("bridge_id", "")}
+    def connection(self):
+        """(config snapshot, generation) for network work outside the lock; no config while a
+        pairing runs, so nothing started then can change what the pairing shows."""
+        with self.lock:
+            return (dict(self.config) if not self.pair_ip else {}), self.conn_generation
 
-    def api(self, method, path, body=None):
-        status, data, _ = https_request(self.config["ip"], method, path, body,
-                                        {"hue-application-key": self.config["app_key"]}, pin=self.pin())
+    def connection_current(self, generation):
+        """Still the connection the work started under, and no pairing running (lock held)."""
+        return bool(self.config) and not self.pair_ip and self.conn_generation == generation
+
+    def known(self, kind, rid):
+        """A light, grouped light or scene of the current model (call with the lock held)."""
+        for room in self.rooms:
+            if kind == "grouped_light" and room["grouped_light"] == rid:
+                return True
+            if kind == "light" and any(light["id"] == rid for light in room["lights"]):
+                return True
+            if kind == "scene" and any(scene["id"] == rid for scene in room["scenes"]):
+                return True
+        return False
+
+    def may_queue(self, kind, rid):
+        """Only resources the panel can show, and at most MAX_PENDING queued (lock held)."""
+        return self.known(kind, rid) and ((kind, rid) in self.pending or len(self.pending) < MAX_PENDING)
+
+    def api(self, method, path, body=None, config=None):
+        config = config if config is not None else self.connection()[0]
+        pin = {"fingerprint": config.get("fingerprint"), "bridge_id": config.get("bridge_id", "")}
+        status, data, _ = https_request(config["ip"], method, path, body,
+                                        {"hue-application-key": config["app_key"]}, pin=pin)
         if status in (401, 403):
             raise PermissionError("bridge rejected the app key")
         if status >= 400:
             raise OSError("bridge returned HTTP %d" % status)
         errors = data.get("errors") if isinstance(data, dict) else None
         if isinstance(errors, list) and errors:
-            first = errors[0] if isinstance(errors[0], dict) else {}
-            raise OSError("bridge error: %s" % clean(first.get("description") or "?", 60))
+            raise BridgeError("bridge reported an error")
         return data
 
     def refresh(self):
-        if not self.config:
+        config, generation = self.connection()
+        if not config:
             return
+        failure = None
         try:
-            data = self.api("GET", "/clip/v2/resource")
+            data = self.api("GET", "/clip/v2/resource", config=config)
             if not isinstance(data, dict) or not isinstance(data.get("data"), list):
                 raise ValueError("unexpected reply")
             rooms, total, on = build_model(data["data"])
             with self.lock:
-                if time.time() >= self.refresh_hold_until:
-                    self.rooms, self.light_count, self.on_count = rooms, total, on
-                self.phase, self.error = "ok", ""
-        except (ValueError, TypeError, KeyError, AttributeError):
-            with self.lock:
-                self.phase = "error"
-                self.set_error("errReply", "The bridge sent a reply this app does not understand.")
+                if self.connection_current(generation):
+                    if time.time() >= self.refresh_hold_until:
+                        self.rooms, self.light_count, self.on_count = rooms, total, on
+                    self.phase, self.error = "ok", ""
+        except (ValueError, TypeError, KeyError, AttributeError, BridgeError):
+            failure = ("errReply", "The bridge sent a reply this app does not understand.")
         except PinError:
-            with self.lock:
-                self.phase = "error"
-                self.set_error("errCert", "The bridge certificate changed. Unpair and pair again if you replaced the bridge.")
+            failure = ("errCert", "The bridge certificate changed. Unpair and pair again if you replaced the bridge.")
         except PermissionError:
-            with self.lock:
-                self.phase = "error"
-                self.set_error("errRejected", "The bridge no longer accepts this app. Unpair and pair again.")
+            failure = ("errRejected", "The bridge no longer accepts this app. Unpair and pair again.")
         except (OSError, socket.timeout, http.client.HTTPException) as exc:
+            failure = ("errUnreachable", "Bridge not reachable (%s)", self.safe(exc, 80))
+        if failure:
             with self.lock:
-                self.phase = "error"
-                self.set_error("errUnreachable", "Bridge not reachable (%s)", clean(exc, 80))
-            self.relocate()
+                current = self.connection_current(generation)
+                if current:
+                    self.phase = "error"
+                    self.set_error(*failure)
+            if current and failure[0] == "errUnreachable":
+                self.relocate(config, generation)
         self.last_refresh = time.time()
 
-    def relocate(self):
-        """The bridge got a new DHCP address: find it again by bridge id via mDNS."""
-        bridge_id = self.config.get("bridge_id")
+    def relocate(self, config, generation):
+        """The bridge got a new DHCP address: find it again by bridge id via mDNS. The new address
+        is saved only if Unpair or another Pair did not replace the connection meanwhile."""
+        bridge_id = config.get("bridge_id")
         if not bridge_id:
             return
         for cand in self.discover_now():
-            if cand["bridge_id"] == bridge_id and cand["ip"] != self.config.get("ip"):
+            if cand["bridge_id"] == bridge_id and cand["ip"] != config.get("ip"):
                 with self.lock:
-                    self.config["ip"] = cand["ip"]
-                    save_config(self.config)
+                    if not self.connection_current(generation):
+                        return
+                    moved = dict(self.config, ip=cand["ip"])
+                    save_config(moved)
+                    self.config = moved
+                    self.conn_generation += 1
                 self.wake.set()
                 return
 
     def discover_now(self):
         return parse_avahi_hue(run_bounded(["avahi-browse", "-rtpk", "_hue._tcp"]).splitlines())
 
-    def discover(self):
+    def claim_discovery(self):
+        """One discovery at a time: True when this caller got the slot."""
         with self.lock:
+            if self.discovering:
+                return False
             self.discovering = True
-        self.emit()
-        found = self.discover_now()
-        with self.lock:
-            self.candidates, self.discovering = found, False
-        self.emit()
+            return True
+
+    def start_discovery(self):
+        if self.claim_discovery():
+            threading.Thread(target=self.run_discovery, daemon=True).start()
+
+    def discover(self):
+        if self.claim_discovery():
+            self.run_discovery()
+
+    def run_discovery(self):
+        """With the slot claimed: browse, publish the candidates, release the slot."""
+        found = []
+        try:
+            self.emit()
+            found = self.discover_now()
+        finally:
+            with self.lock:
+                self.candidates, self.discovering = found, False
+            self.emit()
 
     # -- pairing
     def pairing_current(self, ip, generation):
@@ -700,6 +850,9 @@ class Hue:
                     self.pair_ip = ""
                     self.phase = "unpaired"
                 return
+            with self.lock:
+                if not self.pairing_current(ip, generation):
+                    return   # Cancel, Unpair or a new Pair during the first request: no key request
             host = clean(socket.gethostname(), 19) or "pc"
             _, resp, peer2 = https_request(ip, "POST", "/api",
                                            {"devicetype": "gnome_hue_lights#" + host, "generateclientkey": True})
@@ -709,6 +862,9 @@ class Hue:
             if not isinstance(entry.get("success", {}), dict) or not isinstance(entry.get("error", {}), dict):
                 entry = {}
             key = (entry.get("success") or {}).get("username")
+            client_key = (entry.get("success") or {}).get("clientkey")
+            with self.lock:
+                self.secrets.update(k for k in (key, client_key) if isinstance(k, str) and k)
             if isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", key):
                 config = {
                     "ip": ip, "bridge_id": bridge_id, "fingerprint": peer[0],
@@ -719,6 +875,8 @@ class Hue:
                     if not self.pairing_current(ip, generation):
                         return
                     save_config(config)
+                    self.conn_generation += 1
+                    self.rooms, self.light_count, self.on_count, self.pending = [], 0, 0, {}
                     self.config, self.pair_ip, self.phase, self.error = config, "", "connecting", ""
                 self.wake.set()
             elif (entry.get("error") or {}).get("type") == 101:
@@ -729,16 +887,20 @@ class Hue:
                 with self.lock:
                     if not self.pairing_current(ip, generation):
                         return
-                    self.set_error("errPairFailed", "Pairing failed: %s", clean((entry.get("error") or {}).get("description") or "?", 80))
+                    kind = (entry.get("error") or {}).get("type")
+                    self.set_error("errPairFailed", "Pairing failed: %s",
+                                   "bridge error %d" % kind if type(kind) is int and 0 <= kind < 100000 else "bridge error")
         except (OSError, socket.timeout, http.client.HTTPException, PinError, ValueError) as exc:
             with self.lock:
                 if not self.pairing_current(ip, generation):
                     return
-                self.set_error("errCannotReach", "Cannot reach %s (%s)", ip, clean(exc, 60))
+                self.set_error("errCannotReach", "Cannot reach %s (%s)", ip, self.safe(exc, 60))
 
     # -- control commands
     def queue(self, kind, rid, body):
         with self.lock:
+            if not self.may_queue(kind, rid):
+                return
             key = (kind, rid)
             merged = dict(self.pending.get(key, {}))
             merged.update(body)
@@ -809,21 +971,29 @@ class Hue:
     def send_pending(self):
         sent = False
         now = time.time()
+        config, generation = self.connection()
         with self.lock:
-            items = list(self.pending.items())
+            items = list(self.pending.items()) if config else []
         for (kind, rid), body in items:
             interval = GROUP_INTERVAL if kind == "grouped_light" else LIGHT_INTERVAL
             if now - self.last_sent.get(kind, 0) < interval:
                 continue
             with self.lock:
+                if not self.connection_current(generation):
+                    break   # Unpair, Pair or a relocation since the batch started
                 if self.pending.get((kind, rid)) is not body:
                     continue
                 del self.pending[(kind, rid)]
             try:
-                self.api("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), body)
+                self.api("PUT", "/clip/v2/resource/%s/%s" % (kind, rid), body, config=config)
+            except BridgeError:
+                with self.lock:
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", "bridge error")
             except (OSError, PinError, PermissionError, socket.timeout, http.client.HTTPException) as exc:
                 with self.lock:
-                    self.set_error("errCommand", "Command failed (%s)", clean(exc, 60))
+                    if self.connection_current(generation):
+                        self.set_error("errCommand", "Command failed (%s)", self.safe(exc, 60))
             self.last_sent[kind] = time.time()
             sent = True
         return sent
@@ -839,7 +1009,7 @@ class Hue:
             self.last_refresh = 0
             self.wake.set()
         elif name == "discover":
-            threading.Thread(target=self.discover, daemon=True).start()
+            self.start_discovery()
         elif name == "pair":
             ip = str(cmd.get("ip", "")).strip()
             if not valid_bridge_ip(ip):
@@ -849,6 +1019,8 @@ class Hue:
                 return
             with self.lock:
                 self.pair_generation += 1
+                self.conn_generation += 1
+                self.pending = {}   # commands for the old connection are not sent any more
                 self.pair_ip, self.pair_until, self.phase, self.error = ip, time.time() + PAIR_WINDOW, "pairing", ""
             self.emit()
             self.wake.set()
@@ -858,17 +1030,20 @@ class Hue:
                 self.pair_ip, self.phase = "", ("connecting" if self.config else "unpaired")
             self.emit()
         elif name == "unpair":
-            try:
-                remove_config()
-            except OSError:
-                pass
+            # One lock for invalidating, deleting and clearing: try_pair validates and saves
+            # under it too, so no pairing reply can save a key between deletion and clearing.
             with self.lock:
                 self.pair_generation += 1
+                self.conn_generation += 1
+                try:
+                    remove_config()
+                except OSError:
+                    pass
                 self.pair_ip = ""
                 self.config, self.rooms, self.light_count, self.on_count = {}, [], 0, 0
                 self.phase, self.error, self.pending = "unpaired", "", {}
             self.emit()
-            threading.Thread(target=self.discover, daemon=True).start()
+            self.start_discovery()
         elif name in ("light", "group") and self.config:
             kind = "light" if name == "light" else "grouped_light"
             rid = cmd.get("id")
@@ -877,8 +1052,12 @@ class Hue:
             body = {}
             if isinstance(cmd.get("on"), bool):
                 body["on"] = {"on": cmd["on"]}
-            if isinstance(cmd.get("bri"), (int, float)):
-                body["dimming"] = {"brightness": round(clamp(float(cmd["bri"]), 1.0, 100.0), 1)}
+            bri = cmd.get("bri")
+            if isinstance(bri, (int, float)) and not isinstance(bri, bool):
+                bri = finite(bri, None, 1.0, 100.0)
+                if bri is None:
+                    return
+                body["dimming"] = {"brightness": round(bri, 1)}
                 body["on"] = {"on": True}
             if body:
                 self.queue(kind, rid, body)
@@ -888,6 +1067,8 @@ class Hue:
             rid = cmd.get("id")
             if valid_uuid(rid):
                 with self.lock:
+                    if not self.may_queue("scene", rid):
+                        return
                     self.pending[("scene", rid)] = {"recall": {"action": "active"}}
                     self.refresh_hold_until = 0
                 self.wake.set()
@@ -898,11 +1079,15 @@ class Hue:
         nobody expected) is shown as an error and the next round runs: the thread never dies
         while the helper process stays up, which the extension could not notice."""
         while True:
+            with self.lock:
+                generations = (self.pair_generation, self.conn_generation)
             try:
                 self.work_once()
             except Exception as exc:   # noqa: BLE001 - the loop must survive anything
                 with self.lock:
-                    self.set_error("errInternal", "Something went wrong (%s)", clean(exc, 60))
+                    # Not after Unpair, Cancel or a new Pair: the failure belonged to the old state.
+                    if generations == (self.pair_generation, self.conn_generation):
+                        self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
                 try:
                     self.emit()
                 except OSError:
@@ -911,12 +1096,13 @@ class Hue:
 
     def work_once(self):
         if self.pair_ip:
-            if time.time() > self.pair_until:
-                with self.lock:
+            with self.lock:
+                expired = bool(self.pair_ip) and time.time() > self.pair_until   # a new Pair may have just started
+                if expired:
                     self.pair_ip = ""
-                    self.phase = "unpaired"
+                    self.phase = "connecting" if self.config else "unpaired"
                     self.set_error("errNoPress", "No button press seen. Press the round button on the bridge, then try again.")
-            else:
+            if not expired:
                 self.try_pair()
             self.emit()
             if self.pair_ip:
@@ -948,13 +1134,22 @@ class Hue:
     def run(self):
         self.emit()
         threading.Thread(target=self.worker, daemon=True).start()
-        for line in sys.stdin:
-            cmd = parse_command(line)
-            if cmd:
+        for cmd in read_commands(sys.stdin.buffer):
+            try:
                 self.handle(cmd)
+            except Exception as exc:   # noqa: BLE001 - one bad command must not end the helper
+                with self.lock:
+                    self.set_error("errInternal", "Something went wrong (%s)", self.safe(exc, 60))
+                self.emit()
+
+
+def _terminate(signum, _frame):
+    sys.exit(128 + signum)   # unwinds the main thread; atexit then ends the children
 
 
 def main():
+    atexit.register(kill_children)
+    signal.signal(signal.SIGTERM, _terminate)
     if "--once" in sys.argv:
         hue = Hue()
         hue.refresh()

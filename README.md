@@ -38,7 +38,7 @@ A helper (`scripts/hue-lights.py`) runs while the extension is enabled. The exte
 
 - **Local only:** the helper talks to the bridge's local CLIP v2 API over HTTPS on your LAN. It makes no other network requests.
 - **Pinned certificate:** the bridge uses a self-signed Philips certificate. When pairing, the helper checks that the certificate name equals the bridge ID the bridge reports, and stores the certificate's SHA-256 fingerprint. Every later connection must present exactly that certificate, otherwise nothing is sent.
-- **Bounded requests:** every request has one overall deadline (connect, TLS, headers and body) and a 4 MiB reply limit. `avahi-browse` runs as a fixed argument list with bounded output and a timeout.
+- **Bounded requests:** every request has one overall deadline (connect, TLS, headers and body) and a 4 MiB reply limit. `avahi-browse` runs as a fixed argument list with bounded output and a timeout; when util-linux `setpriv` is installed it is started through `setpriv --pdeathsig KILL --`, so it ends with the helper even if the helper is killed, and the helper ends it on exit or SIGTERM as well.
 - **Validated commands:** light, group and scene IDs must be Hue UUIDs; the bridge address must be a private IPv4 address. Brightness is clamped to 1–100 %, and commands are rate limited as Philips recommends.
 - **Sanitized text:** room, light, scene and bridge names are stripped of `<`, `>`, `&` and control characters and shown as plain text; light colours reach the panel's styles only as `#rrggbb`.
 - **App key:** stored in `~/.config/hue-lights/config.json` (`$XDG_CONFIG_HOME/hue-lights`; directory `0700`, file `0600`, written atomically through a unique temp file). It never leaves the helper process.
@@ -49,7 +49,7 @@ A helper (`scripts/hue-lights.py`) runs while the extension is enabled. The exte
 - No language setting and no plugin Information page; Unpair sits at the bottom of the panel instead of a settings page.
 - The app key lives in `~/.config/hue-lights/` instead of `~/.config/omarchy/hue-lights/`, and the bridge lists the app as `gnome_hue_lights`.
 - An active scene is always shown, also when it is not among the first six.
-- The helper also has fixes from a review of this port: CLIP error replies count as failures, a bridge reply of an unexpected shape shows an error instead of stopping all updates, Cancel or Unpair during a pairing request cannot still save a key, `avahi-browse` ends with the helper, and a FIFO at the config path cannot block it.
+- The helper also has fixes from a review of this port: CLIP error replies count as failures, a bridge reply of an unexpected shape shows an error instead of stopping all updates, Cancel or Unpair during a pairing request cannot still save a key, `avahi-browse` ends with the helper, and a FIFO at the config path cannot block it. Later fixes, shared with the Omarchy plugin's 0.4.2: no result of a refresh, relocation, command or pairing request started before Unpair, Cancel or a new Pair is applied afterwards; non-finite numbers from the bridge are rejected; the request deadline holds after `Connection: close`; panel commands are bounded (4 KiB per line, 256 queued, one discovery at a time); bridge error texts and keys never reach the panel.
 
 ## Update or remove
 
